@@ -1,0 +1,39 @@
+{
+  "properties": {
+    "code_hash": {
+      "pattern": "^blake3:",
+      "type": "string"
+    },
+    "command": {
+      "type": "string"
+    },
+    "container_ref": {
+      "type": "string"
+    },
+    "deterministic": {
+      "const": true
+    },
+    "input_hashes": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "output_hash": {
+      "pattern": "^blake3:",
+      "type": "string"
+    },
+    "runtime": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "code_hash",
+    "input_hashes",
+    "output_hash",
+    "runtime",
+    "deterministic",
+    "command"
+  ],
+  "type": "object"
+}

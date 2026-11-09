@@ -1,0 +1,29 @@
+{
+  "properties": {
+    "evidence_refs": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "explanation": {
+      "minLength": 40,
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "SPECULATIVE",
+        "EVIDENCED"
+      ]
+    },
+    "subclaim_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "subclaim_id",
+    "explanation",
+    "status"
+  ],
+  "type": "object"
+}

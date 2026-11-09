@@ -1,0 +1,86 @@
+{
+  "properties": {
+    "accuses_individual": {
+      "const": false
+    },
+    "challenges_considered": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "confidence": {
+      "maximum": 1,
+      "minimum": 0,
+      "type": "number"
+    },
+    "evidence_refs": {
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "gate_results": {
+      "properties": {
+        "benign_ruled_out": {
+          "type": "boolean"
+        },
+        "coverage_complete": {
+          "type": "boolean"
+        },
+        "fdr_pass": {
+          "type": "boolean"
+        },
+        "fwer_pass": {
+          "type": "boolean"
+        },
+        "power_pass": {
+          "type": "boolean"
+        },
+        "reproduced": {
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "limitations": {
+      "items": {
+        "minLength": 20,
+        "type": "string"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "narrative": {
+      "maxLength": 1200,
+      "type": "string"
+    },
+    "posterior": {
+      "properties": {
+        "alpha": {
+          "type": "number"
+        },
+        "beta": {
+          "type": "number"
+        },
+        "mean": {
+          "type": "number"
+        }
+      },
+      "type": "object"
+    },
+    "subclaim_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "subclaim_id",
+    "evidence_refs",
+    "challenges_considered",
+    "confidence",
+    "limitations",
+    "gate_results"
+  ],
+  "type": "object"
+}

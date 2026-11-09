@@ -1,0 +1,150 @@
+{
+  "properties": {
+    "alternative": {
+      "type": "string"
+    },
+    "baseline_ref": {
+      "pattern": "^blake3:",
+      "type": "string"
+    },
+    "claim_id": {
+      "type": "string"
+    },
+    "family": {
+      "oneOf": [
+        {
+          "properties": {
+            "group": {
+              "const": "OFFICIATING"
+            },
+            "member": {
+              "enum": [
+                "CREW_TENDENCY",
+                "SERIES_EXTENSION",
+                "STAR_DIFFERENTIAL",
+                "L2M_CONTRADICTION"
+              ]
+            }
+          }
+        },
+        {
+          "properties": {
+            "group": {
+              "const": "MARKET"
+            },
+            "member": {
+              "enum": [
+                "PRE_EVENT_DRIFT",
+                "PROP_CONCENTRATION",
+                "CROSS_BOOK_DIVERGENCE"
+              ]
+            }
+          }
+        },
+        {
+          "properties": {
+            "group": {
+              "const": "ROTATION"
+            },
+            "member": {
+              "enum": [
+                "INCENTIVE_DEVIATION"
+              ]
+            }
+          }
+        },
+        {
+          "properties": {
+            "group": {
+              "const": "TEMPORAL"
+            },
+            "member": {
+              "enum": [
+                "CLOCK_ANOMALY"
+              ]
+            }
+          }
+        },
+        {
+          "properties": {
+            "group": {
+              "const": "LOTTERY"
+            },
+            "member": {
+              "enum": [
+                "ODDS_ANOMALY"
+              ]
+            }
+          }
+        },
+        {
+          "properties": {
+            "group": {
+              "const": "STRUCTURAL"
+            },
+            "member": {
+              "enum": [
+                "REST_ASYMMETRY"
+              ]
+            }
+          }
+        },
+        {
+          "properties": {
+            "group": {
+              "const": "SCRIPT"
+            },
+            "member": {
+              "enum": [
+                "PREDETERMINED_TOTALITY"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "min_sample": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "null_hypothesis": {
+      "minLength": 20,
+      "type": "string"
+    },
+    "operationalization": {
+      "minLength": 40,
+      "type": "string"
+    },
+    "required_data": {
+      "items": {
+        "enum": [
+          "OFFICIAL_PBP",
+          "VIDEO",
+          "BETTING_FEED",
+          "SENSOR",
+          "L2M_REPORT",
+          "PRESS_STATEMENT"
+        ]
+      },
+      "type": "array"
+    },
+    "subclaim_id": {
+      "pattern": "^SUB-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "test": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "subclaim_id",
+    "claim_id",
+    "family",
+    "test",
+    "null_hypothesis",
+    "operationalization",
+    "required_data",
+    "min_sample"
+  ],
+  "type": "object"
+}

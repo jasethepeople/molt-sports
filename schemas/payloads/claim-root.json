@@ -1,0 +1,62 @@
+{
+  "properties": {
+    "attribution": {
+      "properties": {
+        "date": {
+          "format": "date",
+          "type": "string"
+        },
+        "medium": {
+          "enum": [
+            "PODCAST",
+            "INTERVIEW",
+            "BOOK",
+            "PRESS",
+            "SOCIAL",
+            "COURT_FILING"
+          ]
+        },
+        "speaker_role_code": {
+          "pattern": "^(PLAYER|COACH|OWNER|OFFICIAL|EXEC|MEDIA|ANON)-[A-Z0-9-]+$",
+          "type": "string"
+        },
+        "url": {
+          "format": "uri",
+          "type": "string"
+        }
+      },
+      "required": [
+        "speaker_role_code",
+        "medium",
+        "date"
+      ],
+      "type": "object"
+    },
+    "claim_id": {
+      "pattern": "^CLM-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "source_ref": {
+      "pattern": "^blake3:",
+      "type": "string"
+    },
+    "source_type": {
+      "enum": [
+        "PRESS_STATEMENT"
+      ]
+    },
+    "verbatim": {
+      "maxLength": 4000,
+      "type": "string"
+    }
+  },
+  "required": [
+    "claim_id",
+    "verbatim",
+    "attribution",
+    "source_type",
+    "source_ref",
+    "first_observed_utc"
+  ],
+  "type": "object"
+}

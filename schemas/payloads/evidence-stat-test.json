@@ -1,0 +1,79 @@
+{
+  "properties": {
+    "alpha_used": {
+      "type": "number"
+    },
+    "baseline_ref": {
+      "type": "string"
+    },
+    "correction_method": {
+      "enum": [
+        "BENJAMINI_HOCHBERG",
+        "BONFERRONI",
+        "HOLM"
+      ]
+    },
+    "effect_size": {
+      "type": "number"
+    },
+    "effect_size_metric": {
+      "enum": [
+        "COHENS_D",
+        "ODDS_RATIO",
+        "RISK_DIFF",
+        "RAW_DIFF"
+      ]
+    },
+    "family_size": {
+      "maximum": 200,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "n": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "p_adjusted": {
+      "maximum": 1,
+      "minimum": 0,
+      "type": "number"
+    },
+    "p_raw": {
+      "maximum": 1,
+      "minimum": 0,
+      "type": "number"
+    },
+    "power_achieved": {
+      "maximum": 1,
+      "minimum": 0,
+      "type": "number"
+    },
+    "replay_proof_ref": {
+      "pattern": "^blake3:",
+      "type": "string"
+    },
+    "statistic": {
+      "type": "number"
+    },
+    "subclaim_id": {
+      "type": "string"
+    },
+    "test_name": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "subclaim_id",
+    "test_name",
+    "statistic",
+    "effect_size",
+    "n",
+    "p_raw",
+    "p_adjusted",
+    "correction_method",
+    "alpha_used",
+    "family_size",
+    "replay_proof_ref"
+  ],
+  "type": "object"
+}

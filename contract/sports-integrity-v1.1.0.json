@@ -1,0 +1,214 @@
+{
+  "$id": "molt://sports/contract/sports-integrity/v1",
+  "contract_version": "1.1.0",
+  "frozen_at": "2025-11-08T00:00:00Z",
+  "hash_alg": "blake3",
+  "sig_alg": "ed25519",
+  "kinds": {
+    "WORLD": [
+      "GENESIS",
+      "ENTITY_REGISTER",
+      "CONTRACT_FREEZE",
+      "BASELINE_ADOPT"
+    ],
+    "IDENTITY": [
+      "UNMASK"
+    ],
+    "INGEST": [
+      "SOURCE_SNAPSHOT",
+      "SOURCE_DISCREPANCY",
+      "SOURCE_REVISION",
+      "COVERAGE_GAP"
+    ],
+    "CLAIM": [
+      "ROOT",
+      "DECOMPOSE",
+      "SUBCLAIM",
+      "TESTIMONY"
+    ],
+    "EVIDENCE": [
+      "STAT_TEST",
+      "SIMULATION",
+      "CAUSAL_ESTIMATE",
+      "BASELINE_COMPARISON",
+      "REPLAY_PROOF",
+      "NULL"
+    ],
+    "CHALLENGE": [
+      "BENIGN",
+      "METHODOLOGICAL",
+      "DATA_QUALITY",
+      "ALTERNATIVE_MODEL"
+    ],
+    "VERDICT": [
+      "SUPPORTED",
+      "PARTIALLY_SUPPORTED",
+      "INCONCLUSIVE",
+      "REFUTED",
+      "UNTESTABLE"
+    ],
+    "ATTEST": [
+      "PROPOSAL",
+      "COSIGN",
+      "SEAL",
+      "PUBLISH",
+      "SUPERSEDE",
+      "RETRACT"
+    ],
+    "QUARANTINE": [
+      "REJECTED"
+    ],
+    "BASELINE": [
+      "PROPOSE",
+      "REVIEW",
+      "ADOPT",
+      "DEPRECATE",
+      "DRIFT_FLAG"
+    ],
+    "REVIEW": [
+      "ASSIGN",
+      "DISCLOSE",
+      "ACCEPT",
+      "REFUSE",
+      "CONCUR",
+      "DISSENT",
+      "TIMEOUT"
+    ]
+  },
+  "roles": [
+    "ENGINE",
+    "OPERATOR",
+    "REVIEWER",
+    "PUBLIC"
+  ],
+  "access_tiers": [
+    "PUBLIC",
+    "MEDIA",
+    "BOOK",
+    "REGULATOR",
+    "REVIEWER"
+  ],
+  "claim_families": {
+    "OFFICIATING": [
+      "CREW_TENDENCY",
+      "SERIES_EXTENSION",
+      "STAR_DIFFERENTIAL",
+      "L2M_CONTRADICTION"
+    ],
+    "MARKET": [
+      "PRE_EVENT_DRIFT",
+      "PROP_CONCENTRATION",
+      "CROSS_BOOK_DIVERGENCE"
+    ],
+    "ROTATION": [
+      "INCENTIVE_DEVIATION"
+    ],
+    "TEMPORAL": [
+      "CLOCK_ANOMALY"
+    ],
+    "LOTTERY": [
+      "ODDS_ANOMALY"
+    ],
+    "STRUCTURAL": [
+      "REST_ASYMMETRY"
+    ],
+    "SCRIPT": [
+      "PREDETERMINED_TOTALITY"
+    ]
+  },
+  "testability": [
+    "TESTABLE",
+    "UNTESTABLE",
+    "TESTIMONY_ONLY"
+  ],
+  "source_types": [
+    "OFFICIAL_PBP",
+    "VIDEO",
+    "BETTING_FEED",
+    "SENSOR",
+    "L2M_REPORT",
+    "PRESS_STATEMENT"
+  ],
+  "thresholds": {
+    "alpha_familywise": 0.01,
+    "multiple_comparison_method": "BENJAMINI_HOCHBERG",
+    "min_power": 0.8,
+    "min_effect_size_floor": 0.05,
+    "min_simulations": 10000,
+    "min_sample_events": 200,
+    "prior_skepticism": {
+      "alpha": 1,
+      "beta": 4,
+      "type": "BETA"
+    },
+    "promotion_ladder": {
+      "SUPPORTED": [
+        "fdr_pass",
+        "fwer_pass",
+        "power_pass",
+        "benign_ruled_out",
+        "reproduced"
+      ],
+      "PARTIALLY_SUPPORTED": [
+        "fdr_pass",
+        "benign_unresolved"
+      ],
+      "INCONCLUSIVE": [
+        "power_fail|method_disagreement|coverage_gap"
+      ],
+      "REFUTED": [
+        "effect_below_floor|fdr_fail"
+      ],
+      "UNTESTABLE": [
+        "no_operationalization"
+      ]
+    }
+  },
+  "policy": {
+    "verdict_may_reference_kinds": [
+      "EVIDENCE",
+      "INGEST",
+      "CLAIM",
+      "CHALLENGE"
+    ],
+    "verdict_may_reference_families": {
+      "EVIDENCE": [
+        "STAT_TEST",
+        "SIMULATION",
+        "CAUSAL_ESTIMATE",
+        "BASELINE_COMPARISON",
+        "NULL",
+        "REPLAY_PROOF"
+      ],
+      "INGEST": [
+        "SOURCE_SNAPSHOT",
+        "SOURCE_DISCREPANCY",
+        "SOURCE_REVISION",
+        "COVERAGE_GAP"
+      ],
+      "CLAIM": [
+        "SUBCLAIM"
+      ]
+    },
+    "forbidden_reference_kinds": [
+      "CLAIM.TESTIMONY",
+      "IDENTITY.UNMASK"
+    ],
+    "forbidden_evidence_sources": [
+      "LLM_NARRATIVE",
+      "TESTIMONY"
+    ],
+    "naming_prohibition": true,
+    "entity_code_pattern": "^(TEAM|CREW|OFFICIAL|PLAYER|COACH|GAME|SEASON|MARKET)-[A-Z0-9-]+$",
+    "null_evidence_mandatory": true,
+    "coverage_gap_mandatory": true,
+    "llm_output_permitted_kinds": [
+      "CLAIM.SUBCLAIM",
+      "CHALLENGE.BENIGN",
+      "CHALLENGE.ALTERNATIVE_MODEL"
+    ],
+    "llm_output_requires_model_versions": true,
+    "monotonic_timestamps_per_stream": true,
+    "max_uncorrected_hypotheses_per_decompose": 200
+  }
+}
