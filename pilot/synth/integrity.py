@@ -76,16 +76,22 @@ def verify_report_integrity(
     hold_df: pd.DataFrame,
     label_dir: pathlib.Path,
     inject_fn=None,
+    series_hold_df: pd.DataFrame | None = None,
 ) -> IntegrityReport:
     """Verify the pilot report can be honestly scored against regenerated data.
 
     Hard fails (raises IntegrityError):
       - report missing or predates provenance tracking
       - hold_df_hash mismatch (the root check)
+      - series_hold_df_hash mismatch, when the report records one
       - any scenario's frame_hash or label_hash mismatch
 
     Soft warns (returns in IntegrityReport):
       - pandas/numpy version drift
+
+    Scenarios tagged "frame": "series" in the report are re-injected from
+    series_hold_df; all others from hold_df. Reports predating the frame tag
+    verify exactly as before (every scenario from hold_df).
     """
     if not report_path.exists():
         raise IntegrityError(f"missing pilot report: {report_path}")
@@ -128,6 +134,41 @@ def verify_report_integrity(
             "or investigate why the data changed."
         )
 
+    # ---- Check 1b: ROOT — series holdout frame, when the report records one ----
+    if "series_hold_df_hash" in report:
+        if series_hold_df is None:
+            raise IntegrityError(
+                "pilot report records series scenarios (series_hold_df_hash present)\n"
+                "but no series holdout frame was supplied for verification.\n"
+                "Re-run the scorer with the current code."
+            )
+        actual_series = frame_hash(series_hold_df)
+        expected_series = report["series_hold_df_hash"]
+        series_match = actual_series == expected_series
+        diagnostics["series_hold_df"] = {
+            "expected": expected_series,
+            "actual": actual_series,
+            "match": series_match,
+        }
+        if not series_match:
+            n_expected = report.get("n_series_holdout_rows", "?")
+            n_actual = int(len(series_hold_df))
+            raise IntegrityError(
+                "SERIES HOLDOUT FRAME CHANGED SINCE PILOT RAN.\n"
+                f"  expected hash: {expected_series}  ({n_expected} rows)\n"
+                f"  actual hash:   {actual_series}  ({n_actual} rows)\n"
+                "\n"
+                "Likely causes, in order of probability:\n"
+                "  1. data/cache/*.parquet was regenerated (re-run run.py to resync)\n"
+                "  2. upstream source changed (check INGEST.SOURCE_REVISION events)\n"
+                "  3. canonical.py transformation changed (bump spec version)\n"
+                "  4. different pandas/numpy version\n"
+                f"  pandas expected={report.get('pandas_version')} actual={pd.__version__}\n"
+                "\n"
+                "Refusing to score. Delete out/pilot_report.json and re-run the pilot,\n"
+                "or investigate why the data changed."
+            )
+
     # ---- Check 2: environment drift (soft) ----
     actual_pandas = pd.__version__
     expected_pandas = report.get("pandas_version")
@@ -153,8 +194,17 @@ def verify_report_integrity(
                 "Re-run run.py with current code."
             )
         seed = int(stored.get("seed") or _default_seed(scenario))
+        if stored.get("frame") == "series":
+            if series_hold_df is None:
+                raise IntegrityError(
+                    f"scenario {scenario}: tagged frame=series but no series "
+                    "holdout frame was supplied for verification."
+                )
+            frame_df = series_hold_df
+        else:
+            frame_df = hold_df
         try:
-            inj_df, label_hash = inject_fn(hold_df, scenario, seed=seed)
+            inj_df, label_hash = inject_fn(frame_df, scenario, seed=seed)
         except Exception as e:
             raise IntegrityError(
                 f"scenario {scenario}: reinjection failed with seed={seed}: {e}"

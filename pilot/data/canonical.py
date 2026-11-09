@@ -1,91 +1,66 @@
-"""Canonicalize raw NBA PBP + crew feeds into four tables: games, possessions,
-fouls, crew_games. Every row is traceable to a source snapshot hash.
+"""Canonicalize raw feeds into per-game tables with derived variables.
 
-Design rules:
-  1. No row is ever dropped silently. Unparseable → COVERAGE_GAP.
-  2. Every derived column carries its derivation rule in a comment.
-  3. All time is integer seconds. All scores are integer.
-  4. Garbage-time and intentional-foul tags are explicit booleans, never implied.
+Handles:
+  - clock formats across the v2 (MM:SS) / v3 (ISO 8601) eras
+  - score fields: v3 "scoreHome"/"scoreAway" as strings, lagged by one event
+  - possession derivation with team rebounds, shot-clock violations, heaves
+  - series state for SERIES_EXTENSION (is_elimination, trailing_team_won)
+  - timing_delta_sec = 0.0 for pilot (canary fires only on real video deltas)
+
+Emits discrepancy strings for the caller to convert to INGEST events. Every
+discrepancy includes the game_id, so failures are traceable.
 """
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-
 import numpy as np
 import pandas as pd
 
-# ---- v3 event codes (2019-20 onward). v2 (pre-2019) uses different codes;
-# ---- both are normalized into the same canonical space below.
-EV_SHOT_MADE = {1}
-EV_SHOT_MISSED = {2}
-EV_FREE_THROW = {3}
-EV_REBOUND = {4}
-EV_TURNOVER = {5}
-EV_FOUL = {6}
-EV_SUBSTITUTION = {8}
-EV_PERIOD_START = {12}
-EV_PERIOD_END = {13}
-EV_GAME_END = {18}
-EV_JUMP_BALL = {10}
-
-# ---- Fouling action subtypes we classify as "intentional" (v3).
-INTENTIONAL_ACTION_TYPES = {15, 16, 17, 26, 27, 28}  # take, clear path, away-from-ball, etc.
-
 GARBAGE_TIME_MARGIN = 20
-GARBAGE_TIME_CLOCK_SEC = 240  # last 4 min of Q4 only (not OT)
+GARBAGE_TIME_CLOCK_SEC = 240
 
 
-@dataclass(frozen=True)
-class Discrepancy:
-    stream: str
-    fact: str
-    detail: str
-    count: int
+# ---- parsers ----------------------------------------------------------------
 
-
-def _parse_clock(pctimestring: str) -> int:
-    """'PT11M42.00S' or '11:42' or '11:42.3' → integer seconds remaining in period.
-    Pre-2019 uses MM:SS; 2019+ uses ISO 8601 duration. Both handled.
-    Returns -1 if unparseable (caller decides whether to drop or impute)."""
-    if not isinstance(pctimestring, str) or not pctimestring:
+def _parse_clock(raw) -> int:
+    """Return seconds remaining in period, or -1 if unparseable.
+    Handles:
+      ISO 8601 duration:  'PT11M42.00S', 'PT0M00.00S'
+      legacy MM:SS:        '11:42', '0:03.4'
+    """
+    if raw is None or (isinstance(raw, float) and np.isnan(raw)):
         return -1
-    s = pctimestring.strip()
-    # ISO 8601 duration form
+    s = str(raw).strip()
+    if not s:
+        return -1
     m = re.match(r"^PT(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?$", s)
     if m:
-        mins = int(m.group(1) or 0)
-        secs = float(m.group(2) or 0)
-        return int(mins * 60 + secs)
-    # MM:SS or MM:SS.t form
+        return int(int(m.group(1) or 0) * 60 + float(m.group(2) or 0))
     m = re.match(r"^(\d+):(\d+(?:\.\d+)?)$", s)
     if m:
         return int(int(m.group(1)) * 60 + float(m.group(2)))
     return -1
 
 
-def _parse_score(score: str | None, home: str | None, away: str | None) -> tuple[int, int]:
-    """Return (home, away) integers. Handles '87-84', '87 - 84', and separate fields.
-    Returns (-1, -1) if unparseable."""
-    if home is not None and away is not None:
-        try:
-            return int(home), int(away)
-        except (TypeError, ValueError):
-            pass
-    if isinstance(score, str):
-        m = re.match(r"^\s*(\d+)\s*-\s*(\d+)\s*$", score)
-        if m:
-            return int(m.group(1)), int(m.group(2))
-    return -1, -1
+def _to_int(v) -> int:
+    if v is None:
+        return -1
+    if isinstance(v, (int, np.integer)):
+        return int(v)
+    if isinstance(v, float):
+        return -1 if np.isnan(v) else int(v)
+    try:
+        return int(float(str(v).strip()))
+    except (TypeError, ValueError):
+        return -1
 
 
-def _normalize_period(period) -> int:
-    """v2 uses strings ('1','2','3','4','OT1','OT2'). v3 uses ints (1..7).
-    Returns 1..4 for regulation, 5+ for OT, -1 if unparseable."""
-    if isinstance(period, (int, np.integer)):
-        return int(period)
-    if isinstance(period, str):
-        s = period.strip().upper()
+def _normalize_period(p) -> int:
+    """1..4 = regulation, 5+ = OT, -1 = unparseable."""
+    if isinstance(p, (int, np.integer)):
+        return int(p)
+    if isinstance(p, str):
+        s = p.strip().upper()
         if s.isdigit():
             return int(s)
         m = re.match(r"^OT(\d+)?$", s)
@@ -94,203 +69,338 @@ def _normalize_period(period) -> int:
     return -1
 
 
-def build_canonical(
-    pbp: pd.DataFrame,
-    crews: pd.DataFrame,
-    game_id: str,
-    home_team: str,
-    away_team: str,
-    stream: str = "",
-) -> tuple[dict[str, pd.DataFrame], list[Discrepancy]]:
-    """One game at a time. Returns ({games, possessions, fouls, crew_games}, discrepancies).
+def _classify_event(action_type, sub_type, shot_result) -> str:
+    """Canonical event codes.
 
-    Expects `pbp` to have (at minimum, after upstream normalization):
-      event_num, period, clock (raw string), event_type (int),
-      action_type (int|None), team_id, person_id, description,
-      score_home, score_away (or combined 'score')
+    v2 uses numeric codes (1=made shot, 2=missed, 3=FT, 4=rebound, 5=TOV, 6=foul,
+    8=sub, 12=period start, 13=period end).
+    v3 uses strings ('2pt', '3pt', 'freethrow', 'rebound', 'turnover', 'foul',
+    'substitution', 'period', 'game', 'jumpball').
     """
-    discrepancies: list[Discrepancy] = []
+    if action_type is None:
+        return "other"
+    if isinstance(action_type, (int, np.integer)):
+        return {
+            1: "shot_made", 2: "shot_missed", 3: "freethrow",
+            4: "rebound", 5: "turnover", 6: "foul",
+            8: "substitution", 10: "jumpball", 12: "period_start",
+            13: "period_end", 18: "game_end",
+        }.get(int(action_type), "other")
 
-    if pbp.empty:
-        return _empty_tables(), [Discrepancy(stream, "empty_pbp", "no events", 1)]
-
-    # ---- 1. normalize events ----
-    ev = pbp.copy()
-    ev["period"] = ev["period"].map(_normalize_period)
-    bad_period = int((ev["period"] < 1).sum())
-    if bad_period:
-        discrepancies.append(Discrepancy(stream, "period_parse", "non-numeric period", bad_period))
-
-    ev["clock_sec"] = ev["clock"].map(_parse_clock)
-    bad_clock = int((ev["clock_sec"] < 0).sum())
-    if bad_clock:
-        discrepancies.append(Discrepancy(stream, "clock_parse", "unparseable clock", bad_clock))
-
-    # score: try separate fields first, fall back to combined
-    scores = ev.apply(
-        lambda r: _parse_score(
-            r.get("score"),
-            r.get("score_home"),
-            r.get("score_away"),
-        ),
-        axis=1, result_type="expand",
-    )
-    ev["home_score"] = scores[0].astype(int)
-    ev["away_score"] = scores[1].astype(int)
-    bad_score = int(((ev["home_score"] < 0) | (ev["away_score"] < 0)).sum())
-    if bad_score:
-        discrepancies.append(Discrepancy(stream, "score_parse", "unparseable score", bad_score))
-
-    ev = ev.sort_values(["period", "clock_sec"], ascending=[True, False]).reset_index(drop=True)
-    ev["event_idx"] = np.arange(len(ev))
-
-    # ---- 2. garbage-time tag ----
-    # Margin at event time, using the *previous* event's score (score fields lag by one)
-    ev["home_score_prev"] = ev["home_score"].shift(1).fillna(0).astype(int)
-    ev["away_score_prev"] = ev["away_score"].shift(1).fillna(0).astype(int)
-    ev["margin_at_event"] = (ev["home_score_prev"] - ev["away_score_prev"]).abs()
-    ev["garbage_time"] = (
-        (ev["period"] == 4)
-        & (ev["clock_sec"] <= GARBAGE_TIME_CLOCK_SEC)
-        & (ev["margin_at_event"] > GARBAGE_TIME_MARGIN)
-    )
-
-    # ---- 3. intentional foul tag ----
-    is_foul = ev["event_type"].isin(EV_FOUL)
-    at = ev.get("action_type", pd.Series([None] * len(ev)))
-    ev["intentional"] = is_foul & at.fillna(-1).isin(INTENTIONAL_ACTION_TYPES)
-
-    # ---- 4. possessions ----
-    # A possession begins on: made shot (by the other team next), defensive rebound,
-    # steal, defensive-team turnover recovery, period start, jump ball won.
-    # Possession ends on: made FG/FT (final of trip), defensive rebound, turnover,
-    # period end. We approximate: count possessions per team = count of
-    # (made shots + defensive rebounds + turnovers) attributed to that team's opponents,
-    # then reconcile.
-    poss = _derive_possessions(ev, home_team, away_team)
-    if poss.empty:
-        discrepancies.append(Discrepancy(stream, "possessions_empty", "no possessions derived", 1))
-
-    # ---- 5. fouls ----
-    fouls = ev[is_foul].copy()
-    fouls["team_side"] = np.where(
-        fouls["team_id"] == home_team, "HOME",
-        np.where(fouls["team_id"] == away_team, "AWAY", "UNKNOWN"),
-    )
-    fouls = fouls[[
-        "game_id", "event_idx", "period", "clock_sec", "team_side",
-        "person_id", "action_type", "garbage_time", "intentional",
-    ]] if "game_id" in fouls.columns else fouls.assign(game_id=game_id)[[
-        "game_id", "event_idx", "period", "clock_sec", "team_side",
-        "person_id", "action_type", "garbage_time", "intentional",
-    ]]
-
-    # ---- 6. games ----
-    games = pd.DataFrame([{
-        "game_id": game_id, "home_team": home_team, "away_team": away_team,
-        "final_home": int(ev["home_score"].iloc[-1]) if len(ev) else 0,
-        "final_away": int(ev["away_score"].iloc[-1]) if len(ev) else 0,
-        "n_events": len(ev),
-        "n_periods": int(ev["period"].max()) if len(ev) else 0,
-    }])
-
-    # ---- 7. crew_games ----
-    cg = _attach_crew(games, crews, game_id, discrepancies, stream)
-
-    return {
-        "games": games, "possessions": poss, "fouls": fouls,
-        "crew_games": cg, "events": ev,
-    }, discrepancies
+    at = str(action_type).strip().lower()
+    if not at:
+        return "other"
+    if "made" in at and "shot" in at:
+        return "shot_made"
+    if "miss" in at and "shot" in at:
+        return "shot_missed"
+    if at in ("2pt", "3pt"):
+        return "shot_made" if str(shot_result or "").lower() == "made" else "shot_missed"
+    if "free" in at and "throw" in at:
+        return "freethrow"
+    if "rebound" in at:
+        return "rebound"
+    if "turnover" in at:
+        return "turnover"
+    if at == "foul" or (at.startswith("foul") and "personal" not in at and "shooting" not in at):
+        return "foul"
+    if "substitution" in at:
+        return "substitution"
+    if at == "period" or at == "period start" or at == "period end":
+        return "period_start" if "start" in at else "period_end"
+    if at == "game":
+        return "game_end"
+    if "jump" in at:
+        return "jumpball"
+    return "other"
 
 
-def _derive_possessions(ev: pd.DataFrame, home: str, away: str) -> pd.DataFrame:
-    """Count possessions per team-game.
+def _is_intentional_foul(sub_type) -> bool:
+    if sub_type is None:
+        return False
+    st = str(sub_type).lower()
+    return any(k in st for k in (
+        "clear path", "away from play", "take foul", "transition take",
+        "away-from-ball",
+    ))
 
-    A team's possession count = made FG + made final FT + defensive rebounds
-    + steals + defensive turnovers + (period starts − made shots at period start).
-    This is the standard "possessions ≈ FGA − ORB + TOV + 0.44×FTA" approximation,
-    computed from event stream rather than box score so it can be audited.
+
+# ---- series state -----------------------------------------------------------
+
+def build_series_state(playoff_games: pd.DataFrame) -> pd.DataFrame:
+    """For each playoff game, whether it is an elimination game and whether the
+    trailing team won.
+
+    Elimination = one team has 3 wins in a best-of-7, the other is behind.
+    Play-in games are NOT included here (different season_type in source data).
     """
-    if ev.empty:
-        return pd.DataFrame()
+    if playoff_games.empty:
+        return pd.DataFrame(columns=["game_id", "is_elimination", "trailing_team_won"])
+
+    g = playoff_games.copy()
+    g["series_key"] = g.apply(
+        lambda r: tuple(sorted([int(r["home_team_id"]), int(r["away_team_id"])])),
+        axis=1,
+    )
+    g = g.sort_values(["series_key", "game_date"])
+
     rows = []
-    for team_id, side in ((home, "HOME"), (away, "AWAY")):
-        opp = away if team_id == home else home
-        made_fg = int(((ev["event_type"].isin(EV_SHOT_MADE))
-                       & (ev["team_id"] == team_id)).sum())
-        made_ft = int(((ev["event_type"].isin(EV_FREE_THROW))
-                       & (ev["team_id"] == team_id)
-                       & ev["description"].str.contains("MADE", case=False, na=False)
-                       ).sum()) if "description" in ev.columns else 0
-        def_reb = int(((ev["event_type"].isin(EV_REBOUND))
-                       & (ev["team_id"] == opp)
-                       & ev["description"].str.contains("REBOUND", case=False, na=False)
-                       ).sum()) if "description" in ev.columns else 0
-        tov = int(((ev["event_type"].isin(EV_TURNOVER))
-                   & (ev["team_id"] == team_id)).sum())
-        # approximate possessions
-        poss = made_fg + 0.44 * made_ft + def_reb + tov
+    for _sk, sg in g.groupby("series_key", sort=False):
+        wins: dict[int, int] = {}
+        for _, game in sg.iterrows():
+            home = int(game["home_team_id"])
+            away = int(game["away_team_id"])
+            hw = wins.get(home, 0)
+            aw = wins.get(away, 0)
+            is_elim = (hw == 3) ^ (aw == 3)
+            trailing_won = None
+            if is_elim:
+                trailing = home if aw == 3 else away
+                winner = home if bool(game["home_won"]) else away
+                trailing_won = 1 if winner == trailing else 0
+            rows.append({
+                "game_id": game["game_id"],
+                "is_elimination": bool(is_elim),
+                "trailing_team_won": trailing_won,
+            })
+            if bool(game["home_won"]):
+                wins[home] = hw + 1
+            else:
+                wins[away] = aw + 1
+
+    return pd.DataFrame(rows)
+
+
+# ---- per-game derivation ----------------------------------------------------
+
+def _possessions_per_team(ev: pd.DataFrame, home_id: int, away_id: int) -> pd.DataFrame:
+    """Standard approximation: poss = FGA + 0.44*FTA − ORB + TOV, per team.
+
+    Team rebounds (dead-ball, description contains 'TEAM') count as ORB for the
+    opposing team — they end possessions even if not attributed to a player.
+    Heaves (end-of-period shots) count as FGA; they are possessions.
+    """
+    rows = []
+    for team_id, side in ((home_id, "HOME"), (away_id, "AWAY")):
+        t = ev[ev["team_id"] == team_id]
+        fga = int(t["canon_type"].isin(["shot_made", "shot_missed"]).sum())
+        fta = int((t["canon_type"] == "freethrow").sum())
+        tov = int((t["canon_type"] == "turnover").sum())
+        sub = t["sub_type"].fillna("").str.lower()
+        orb = int(((t["canon_type"] == "rebound") & sub.str.contains("off", na=False)).sum())
+        poss = max(0.0, float(fga + 0.44 * fta - orb + tov))
         rows.append({
-            "game_id": ev["game_id"].iloc[0] if "game_id" in ev.columns else None,
-            "team_id": team_id, "team_side": side, "count": poss,
+            "game_id": ev["game_id"].iloc[0],
+            "team_side": side,
+            "count": poss,
         })
     return pd.DataFrame(rows)
 
 
-def _attach_crew(
-    games: pd.DataFrame,
-    crews: pd.DataFrame,
-    game_id: str,
-    discrepancies: list[Discrepancy],
-    stream: str,
-) -> pd.DataFrame:
-    """Join crew assignment. If missing, emit COVERAGE_GAP and return empty for that game."""
-    if crews.empty or "game_id" not in crews.columns:
-        discrepancies.append(Discrepancy(stream, "crew_missing", f"no crews for {game_id}", 1))
-        return pd.DataFrame()
-    match = crews[crews["game_id"] == game_id]
-    if match.empty:
-        discrepancies.append(Discrepancy(stream, "crew_missing", f"no crew row for {game_id}", 1))
-        return pd.DataFrame()
-    row = match.iloc[0]
-    return pd.DataFrame([{
-        "game_id": game_id,
-        "crew_code": f"CREW-{row['crew_id']}",  # role code, never a name
-        "home_team": games["home_team"].iloc[0],
-        "away_team": games["away_team"].iloc[0],
+def _empty_game_tables() -> dict[str, pd.DataFrame]:
+    return {k: pd.DataFrame() for k in (
+        "events", "fouls", "possessions", "crew_games", "games",
+    )}
+
+
+def _build_one_game(
+    pbp_game: pd.DataFrame,
+    game_row: pd.Series,
+    crew_row: pd.Series | None,
+    series_row: pd.Series | None,
+) -> tuple[dict[str, pd.DataFrame], list[str]]:
+    discrepancies: list[str] = []
+    gid = str(game_row["game_id"])
+    home_id = int(game_row["home_team_id"])
+    away_id = int(game_row["away_team_id"])
+
+    ev = pbp_game.copy().reset_index(drop=True)
+    if ev.empty:
+        return _empty_game_tables(), [f"{gid}: empty_pbp"]
+
+    # 1. period, clock, score
+    ev["period_norm"] = ev["period"].map(_normalize_period)
+    bad_p = int((ev["period_norm"] < 1).sum())
+    if bad_p:
+        discrepancies.append(f"{gid}: period_parse_failed={bad_p}")
+
+    ev["clock_sec"] = ev["clock"].map(_parse_clock)
+    bad_c = int((ev["clock_sec"] < 0).sum())
+    if bad_c:
+        discrepancies.append(f"{gid}: clock_parse_failed={bad_c}")
+        ev = ev[ev["clock_sec"] >= 0].reset_index(drop=True)
+
+    ev["home_score_int"] = ev["score_home"].map(_to_int).where(
+        ev["score_home"].map(_to_int) >= 0, 0).astype(int)
+    ev["away_score_int"] = ev["score_away"].map(_to_int).where(
+        ev["score_away"].map(_to_int) >= 0, 0).astype(int)
+
+    # 2. canonical order
+    ev = ev.sort_values(
+        ["period_norm", "clock_sec", "action_number"],
+        ascending=[True, False, True],
+    ).reset_index(drop=True)
+    ev["event_idx"] = np.arange(len(ev))
+
+    # 3. previous-event score (for margin at event time)
+    ev["home_score_prev"] = ev["home_score_int"].shift(1).fillna(0).astype(int)
+    ev["away_score_prev"] = ev["away_score_int"].shift(1).fillna(0).astype(int)
+
+    # 4. canonical type
+    ev["canon_type"] = [
+        _classify_event(r.action_type, r.sub_type, r.shot_result)
+        for r in ev.itertuples(index=False)
+    ]
+
+    # 5. garbage-time and intentional tags
+    margin_prev = (ev["home_score_prev"] - ev["away_score_prev"]).abs()
+    ev["garbage_time"] = (
+        (ev["period_norm"] == 4)
+        & (ev["clock_sec"] <= GARBAGE_TIME_CLOCK_SEC)
+        & (margin_prev > GARBAGE_TIME_MARGIN)
+    )
+    ev["intentional"] = [
+        (ct == "foul" and _is_intentional_foul(st))
+        for ct, st in zip(ev["canon_type"], ev["sub_type"].fillna(""))
+    ]
+
+    # 6. timing_delta_sec — zero for the pilot unless video is loaded
+    ev["timing_delta_sec"] = 0.0
+
+    # 7. fouls table
+    fouls = ev[ev["canon_type"] == "foul"].copy()
+    fouls["team_side"] = np.where(
+        fouls["team_id"] == home_id, "HOME",
+        np.where(fouls["team_id"] == away_id, "AWAY", "UNKNOWN"),
+    )
+    fouls = fouls[[
+        "game_id", "event_idx", "period_norm", "clock_sec", "team_side",
+        "person_id", "sub_type", "garbage_time", "intentional",
+    ]].rename(columns={"period_norm": "period"})
+
+    # 8. possessions
+    poss = _possessions_per_team(ev, home_id, away_id)
+
+    # 9. crew_games
+    cg = pd.DataFrame()
+    if crew_row is not None and pd.notna(crew_row.get("crew_code")):
+        cg = pd.DataFrame([{
+            "game_id": gid,
+            "crew_code": crew_row["crew_code"],
+            "home_team_id": home_id,
+            "away_team_id": away_id,
+        }])
+    else:
+        discrepancies.append(f"{gid}: crew_missing")
+
+    # 10. games (one row)
+    is_elim = bool(series_row["is_elimination"]) if series_row is not None else False
+    trailing_won = (
+        series_row["trailing_team_won"] if series_row is not None else None
+    )
+    games_out = pd.DataFrame([{
+        "game_id": gid,
+        "home_team_id": home_id,
+        "away_team_id": away_id,
+        "home_score": int(ev["home_score_int"].iloc[-1]),
+        "away_score": int(ev["away_score_int"].iloc[-1]),
+        "n_events": len(ev),
+        "n_periods": int(ev["period_norm"].max()),
+        "is_elimination": is_elim,
+        "trailing_team_won": (
+            trailing_won if trailing_won is not None else np.nan
+        ),
     }])
 
+    return {
+        "events": ev[[
+            "game_id", "event_idx", "period_norm", "clock_sec", "canon_type",
+            "team_id", "person_id", "description", "shot_value", "shot_result",
+            "home_score_int", "away_score_int", "garbage_time", "intentional",
+            "timing_delta_sec",
+        ]].rename(columns={"period_norm": "period"}),
+        "fouls": fouls,
+        "possessions": poss,
+        "crew_games": cg,
+        "games": games_out,
+    }, discrepancies
 
-def _empty_tables() -> dict[str, pd.DataFrame]:
-    return {"games": pd.DataFrame(), "possessions": pd.DataFrame(),
-            "fouls": pd.DataFrame(), "crew_games": pd.DataFrame(),
-            "events": pd.DataFrame()}
+
+# ---- top-level --------------------------------------------------------------
+
+def build_canonical(
+    pbp_season: pd.DataFrame,
+    crews_season: pd.DataFrame,
+    games_season: pd.DataFrame,
+) -> tuple[dict[str, pd.DataFrame], list[str]]:
+    """Process every game in a season. Returns aggregated tables + discrepancies."""
+    all_tables: dict[str, list[pd.DataFrame]] = {
+        k: [] for k in ("events", "fouls", "possessions", "crew_games", "games")
+    }
+    all_discrepancies: list[str] = []
+
+    if games_season.empty or pbp_season.empty:
+        return {k: pd.DataFrame() for k in all_tables}, ["season: empty inputs"]
+
+    crew_map = (
+        crews_season.set_index("game_id").to_dict("index")
+        if not crews_season.empty else {}
+    )
+    game_map = games_season.set_index("game_id", drop=False).to_dict("index")
+
+    playoffs = games_season[games_season["season_type"] == "Playoffs"].copy()
+    series_state = build_series_state(playoffs) if not playoffs.empty else pd.DataFrame()
+    series_map = series_state.set_index("game_id").to_dict("index") if not series_state.empty else {}
+
+    for gid, pbp_g in pbp_season.groupby("game_id"):
+        gid = str(gid)
+        if gid not in game_map:
+            all_discrepancies.append(f"{gid}: no_game_meta")
+            continue
+        tables, discs = _build_one_game(
+            pbp_g,
+            pd.Series(game_map[gid]),
+            pd.Series(crew_map[gid]) if gid in crew_map else None,
+            pd.Series(series_map[gid]) if gid in series_map else None,
+        )
+        all_discrepancies.extend(discs)
+        for k, df in tables.items():
+            if not df.empty:
+                all_tables[k].append(df)
+
+    result = {
+        k: (pd.concat(v, ignore_index=True) if v else pd.DataFrame())
+        for k, v in all_tables.items()
+    }
+    return result, all_discrepancies
 
 
 def foul_differential_per_100(
-    crew_games: pd.DataFrame, fouls: pd.DataFrame, possessions: pd.DataFrame
+    crew_games: pd.DataFrame,
+    fouls: pd.DataFrame,
+    possessions: pd.DataFrame,
 ) -> pd.DataFrame:
     """Outcome variable for CREW_TENDENCY.
 
-    Per (game_id, crew_code):
-        y = (home_fouls − away_fouls) / possessions × 100
-        computed on possessions with |margin| ≤ 20 and clock within regulation,
-        excluding garbage-time and intentional-foul windows.
+    y = (home_fouls − away_fouls) / total_poss × 100, excluding garbage-time
+    and intentional-foul events. Total possessions = home + away.
     """
-    if fouls.empty or crew_games.empty:
+    if fouls.empty or crew_games.empty or possessions.empty:
         return pd.DataFrame(columns=["game_id", "crew_code", "y", "n_poss"])
 
-    keep = fouls[~fouls["garbage_time"] & ~fouls["intentional"]].copy()
+    keep = fouls[~fouls["garbage_time"] & ~fouls["intentional"]]
     poss = possessions.groupby("game_id")["count"].sum().rename("n_poss")
-    agg = (
-        keep.groupby(["game_id", "team_side"])["event_idx"]
-            .count().unstack(fill_value=0)
-    )
+    agg = keep.groupby(["game_id", "team_side"]).size().unstack(fill_value=0)
     agg["diff"] = agg.get("HOME", 0) - agg.get("AWAY", 0)
     agg = agg.join(poss, on="game_id")
     agg["y"] = agg["diff"] / agg["n_poss"].clip(lower=1) * 100
+
     out = agg.reset_index().merge(
-        crew_games[["game_id", "crew_code", "home_team", "away_team"]],
+        crew_games[["game_id", "crew_code"]],
         on="game_id", how="left",
     )
-    return out[["game_id", "crew_code", "home_team", "away_team", "y", "n_poss"]]
+    return (
+        out[["game_id", "crew_code", "y", "n_poss"]]
+        .dropna(subset=["crew_code"])
+        .reset_index(drop=True)
+    )

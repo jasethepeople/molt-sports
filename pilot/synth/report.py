@@ -16,6 +16,7 @@ import sys
 from dataclasses import dataclass
 
 import pandas as pd
+import numpy as np
 
 from families.officiating_crew import CrewTendency
 from harness.protocol import TestContext, BaselineRef
@@ -240,29 +241,54 @@ def main() -> int:
 
     # Re-derive the injected frames from the same generator (deterministic seeds)
     from synth.inject import inject
-    from data.sources import fetch_season_pbp, fetch_crew_assignments
+    from data.sources import fetch_season_pbp, fetch_crew_assignments, fetch_season_games
     from data.canonical import build_canonical, foul_differential_per_100
 
     # For scoring, we reload holdout from cache and re-inject with the same seeds.
     # This is why inject() must be deterministic — the labels in out/labels/*.json
     # are the audit trail; the data is regenerated deterministically here.
+    # The rebuild mirrors run.py's load_all() exactly (season-level
+    # build_canonical, same games/pbp/crews fetch, same series-frame
+    # construction) — otherwise the integrity gate's root hashes can never match.
     hold_frames = []
+    series_frames = []
     for s in meta["holdout"]:
+        games, _ = fetch_season_games(s, "Regular Season")
+        try:
+            games_po, _ = fetch_season_games(s, "Playoffs")
+        except RuntimeError:
+            games_po = pd.DataFrame()
+        games_all = pd.concat([games, games_po], ignore_index=True) if not games_po.empty else games
+
         pbp, _ = fetch_season_pbp(s)
         crews, _ = fetch_crew_assignments(s)
-        for gid in pbp["game_id"].unique() if "game_id" in pbp.columns else []:
-            canon, _ = build_canonical(
-                pbp[pbp["game_id"] == gid],
-                crews,
-                game_id=str(gid),
-                home_team="", away_team="",
-            )
-            if not canon["crew_games"].empty:
-                cg = foul_differential_per_100(
-                    canon["crew_games"], canon["fouls"], canon["possessions"])
-                cg["season"] = s
-                hold_frames.append(cg)
+        canon, _ = build_canonical(pbp, crews, games_all)
+        if not canon["crew_games"].empty:
+            cg = foul_differential_per_100(
+                canon["crew_games"], canon["fouls"], canon["possessions"])
+            cg["season"] = s
+            # Adjustment set for CREW_TENDENCY — identical to run.py's
+            # load_all (see the comment there). The gate hashes these as
+            # part of hold_df, so any drift here fails Check 1 loudly.
+            margins = canon["games"][["game_id", "home_score", "away_score"]].copy()
+            m = (margins["home_score"] - margins["away_score"]).abs()
+            margins["margin_bucket"] = np.where(m <= 5, 0, np.where(m <= 15, 1, 2)).astype(int)
+            cg = cg.merge(margins[["game_id", "margin_bucket"]], on="game_id", how="left")
+            cg["pace"] = cg["n_poss"]
+            cg["rest_diff"] = 0
+            hold_frames.append(cg)
+        if not canon["games"].empty:
+            g = canon["games"].copy()
+            g["season"] = s
+            g = g.merge(
+                canon["crew_games"][["game_id", "crew_code"]], on="game_id", how="left")
+            g["home"] = 1
+            g["rest_diff"] = 0
+            g["injury_active"] = 0
+            g["crew_trailing_flag"] = g["crew_code"].notna().astype(int)
+            series_frames.append(g)
     hold_df = pd.concat(hold_frames, ignore_index=True) if hold_frames else pd.DataFrame()
+    series_hold_df = pd.concat(series_frames, ignore_index=True) if series_frames else pd.DataFrame()
 
     if hold_df.empty:
         print("no holdout rows; run run.py first to populate cache")
@@ -273,7 +299,8 @@ def main() -> int:
         verify_report_integrity, IntegrityError, EXIT_INTEGRITY,
     )
     try:
-        integrity = verify_report_integrity(report_path, hold_df, LABELS)
+        integrity = verify_report_integrity(
+            report_path, hold_df, LABELS, series_hold_df=series_hold_df)
     except IntegrityError as e:
         print("\n### INTEGRITY FAILURE\n")
         print(str(e))
@@ -311,9 +338,11 @@ def main() -> int:
     inj_df, _ = inject(hold_df, "T-DIFFUSE", seed=100)
     scores.append(score_T_diffuse(inj_df, LABELS / "T-DIFFUSE_seed100.json"))
 
-    # T-DEAD (only if elimination frame exists in meta)
-    if "is_elimination" in hold_df.columns or "series_extension" in meta.get("results", {}):
-        inj_df, _ = inject(hold_df, "T-DEAD", seed=200)
+    # T-DEAD (only if the series holdout frame has elimination games).
+    # Scored from the SERIES holdout frame, not the crew frame — the
+    # injection in run.py was made there, and the gate verified it there.
+    if not series_hold_df.empty and "is_elimination" in series_hold_df.columns:
+        inj_df, _ = inject(series_hold_df, "T-DEAD", seed=200)
         scores.append(score_T_dead(inj_df, LABELS / "T-DEAD_seed200.json"))
 
     md = render_markdown(scores, meta)
