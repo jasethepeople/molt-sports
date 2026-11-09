@@ -30,17 +30,29 @@ CREW_BASELINE = BaselineRef(
 )
 
 
-def load_all(seasons: list[str]) -> dict[str, pd.DataFrame]:
+def load_all(seasons: list[str]) -> pd.DataFrame:
+    # Per-game build, mirroring synth/report.py's holdout rebuild exactly:
+    # build_canonical() takes one game at a time and returns
+    # (tables, discrepancies). run.py and report.py must canonicalize the
+    # same way, or the integrity gate's hold_df_hash root check can never pass.
+    # home_team/away_team are "" placeholders until the data layer (sources.py,
+    # still TODO) supplies real team IDs — both sides must change together.
     dfs = []
     for s in seasons:
         pbp, _ = fetch_season_pbp(s)
         crews, _ = fetch_crew_assignments(s)
-        canon = build_canonical(pbp, crews)
-        if not canon["crew_games"].empty:
-            cg = foul_differential_per_100(
-                canon["crew_games"], canon["fouls"], canon["possessions"])
-            cg["season"] = s
-            dfs.append(cg)
+        for gid in pbp["game_id"].unique() if "game_id" in pbp.columns else []:
+            canon, _ = build_canonical(
+                pbp[pbp["game_id"] == gid],
+                crews,
+                game_id=str(gid),
+                home_team="", away_team="",
+            )
+            if not canon["crew_games"].empty:
+                cg = foul_differential_per_100(
+                    canon["crew_games"], canon["fouls"], canon["possessions"])
+                cg["season"] = s
+                dfs.append(cg)
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
 
@@ -115,7 +127,11 @@ def main() -> int:
         report["results"]["series_extension"] = se_res.model_dump()
 
         for scenario in ["T-EXTENSION", "T-DEAD"]:
-            inj_df, label_hash = inject(df, scenario, seed=200)
+            # Injected from hold_df, like the four crew scenarios above:
+            # the integrity gate (synth/integrity.py Check 3) and the scorer
+            # (synth/report.py) both re-inject every scenario from hold_df,
+            # so injecting from the full frame here could never reproduce.
+            inj_df, label_hash = inject(hold_df, scenario, seed=200)
             r = SeriesExtension().run(se_ctx, inj_df)
             report["injections"][scenario] = {
                 "label_hash": label_hash,
